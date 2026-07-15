@@ -136,31 +136,59 @@ class Session:
         return response.json()
 
     def _get_instruments(self):
-        new_headers = {
-            'accept': 'application/json, text/plain, */*',
-            'accept-language': 'en-GB,en;q=0.9',
-            'kite-iframe': 'kite_iframe_user',
-            'origin': 'https://insights.sensibull.com',
-            'referer': 'https://insights.sensibull.com/',
-            'sec-ch-ua': '"Brave";v="123", "Not:A-Brand";v="8", "Chromium";v="123"',
-            'sec-ch-ua-mobile': '?0',
-            'sec-ch-ua-platform': '"Linux"',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-site',
-            'sec-gpc': '1',
-            'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-        }
-        response = requests.get('https://oxide.sensibull.com/v1/compute/cache/insights/instrument_metacache/1', headers=new_headers)
-        next_resp = requests.get('https://oxide.sensibull.com/v1/compute/cache/insights/underlying_instruments', headers=new_headers)
+        # Zerodha's own instrument dump (public CSV, no third party). Replaces the old Sensibull oxide cache,
+        # which now 401s behind an "insights access token". Builds the SAME nested schema trader.py reads,
+        # with authoritative tradingsymbols straight from the exchange.
+        import csv, io
         print('getting instrument tokens')
-        if response.status_code == 200:
-            resp = response.json()
-            del resp['etag']
-            self.instruments = resp
-            self.ins_details_cache = next_resp.json()['data']
-        else:
+        EXCHANGES = ['NFO', 'BFO', 'NSE', 'BSE']
+        INDEX_MAP = {'NIFTY 50': 'NIFTY', 'NIFTY BANK': 'BANKNIFTY', 'NIFTY FIN SERVICE': 'FINNIFTY',
+                     'NIFTY MID SELECT': 'MIDCPNIFTY', 'NIFTY NEXT 50': 'NIFTYNXT50',
+                     'SENSEX': 'SENSEX', 'BANKEX': 'BANKEX'}
+        instruments = {'derivatives': {}, 'underlyer_list': {
+            'NSE': {'NSE': {'EQ': {}}, 'NSE-INDICES': {'EQ': {}}},
+            'BSE': {'BSE': {'EQ': {}}, 'BSE-INDICES': {'EQ': {}}}}}
+        details = {}
+        for exch in EXCHANGES:
+            try:
+                txt = requests.get('https://api.kite.trade/instruments/{}'.format(exch), timeout=60).text
+            except Exception as e:
+                print('  instruments fetch failed for {}: {}'.format(exch, e))
+                continue
+            for row in csv.DictReader(io.StringIO(txt)):
+                try:
+                    tok = int(row['instrument_token'])
+                except (KeyError, ValueError):
+                    continue
+                ts, name, itype = row['tradingsymbol'], row['name'], row['instrument_type']
+                seg, expiry, exchange = row['segment'], row['expiry'], row['exchange']
+                entry = {'tradingsymbol': ts, 'instrument_token': tok}
+                details[str(tok)] = {'tradingsymbol': ts, 'name': name, 'expiry': expiry, 'strike': row['strike'],
+                                     'instrument_type': itype, 'lot_size': row['lot_size'],
+                                     'tick_size': row['tick_size'], 'segment': seg, 'exchange': exchange}
+                if itype in ('CE', 'PE'):
+                    node = instruments['derivatives'].setdefault(name, {'derivatives': {}})['derivatives'].setdefault(expiry, {'options': {}})
+                    try:
+                        skey = '{}.0'.format(int(float(row['strike'])))
+                    except ValueError:
+                        continue
+                    node['options'].setdefault(skey, {})[itype] = entry
+                elif itype == 'FUT':
+                    node = instruments['derivatives'].setdefault(name, {'derivatives': {}})['derivatives'].setdefault(expiry, {'options': {}})
+                    node['tradingsymbol'], node['instrument_token'] = ts, tok
+                elif seg == 'INDICES':
+                    exbk = 'NSE' if exchange == 'NSE' else 'BSE'
+                    idx = instruments['underlyer_list'][exbk][exbk + '-INDICES']['EQ']
+                    idx[INDEX_MAP.get(name, name.replace(' ', '').upper())] = entry
+                    idx[name.upper()] = entry
+                elif itype == 'EQ':
+                    exbk = 'NSE' if exchange == 'NSE' else 'BSE'
+                    instruments['underlyer_list'][exbk][exbk]['EQ'][ts.upper()] = entry
+        # order each derivative's expiries nearest-first (get_expiries()[0] must be the front contract)
+        for d in instruments['derivatives'].values():
+            d['derivatives'] = dict(sorted(d['derivatives'].items(), key=lambda kv: kv[0]))
+        if 'NIFTY' not in instruments['derivatives']:
             raise Exception('Failed to get instruments')
-        
-        #sleep(2)
+        self.instruments = instruments
+        self.ins_details_cache = details
         
